@@ -43,8 +43,13 @@ public final class SpatialIndex {
     public SpatialIndex(float32[] points, uint32 count, float32 radius) {
         this.pointCount = count;
         this.halfExtent = radius;
-        float32[] boxes = new float32[count * 6];
-        for (uint32 i = 0; i < count; i = i + 1) {
+        // Index/size arithmetic in 64-bit: `count * 6` (and `i * 6`) would
+        // overflow a uint32 past ~715M points, undersizing the box buffer and
+        // corrupting the heap on bounds-off builds. Widen so it can't wrap (a
+        // genuinely huge count just fails the allocation cleanly instead).
+        int64 n = (int64) count;
+        float32[] boxes = new float32[n * 6];
+        for (int64 i = 0; i < n; i = i + 1) {
             float32 x = points[i * 3 + 0];
             float32 y = points[i * 3 + 1];
             float32 z = points[i * 3 + 2];
