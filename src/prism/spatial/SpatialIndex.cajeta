@@ -1,0 +1,106 @@
+package prism.spatial;
+
+import cajeta.xpu.core.AccelerationStructure;
+import cajeta.xpu.core.Buffer;
+import cajeta.xpu.core.RayQuery;
+import cajeta.xpu.core.Stream;
+import cajeta.xpu.core.Thread;
+
+/**
+ * SpatialIndex — Prism's RT-as-compute spatial primitive (plan P1, Stage P1.0).
+ *
+ * The distinctive thing Prism offers over torch/JAX: hardware ray tracing
+ * repurposed as a general-purpose spatial-index accelerator. Users build an
+ * index over points and run massively-parallel neighbourhood queries; the
+ * "ray tracing" (degenerate near-zero-length rays, AABB-as-index-entry) is
+ * entirely library-internal and never surfaced — the mental model is a
+ * SpatialIndex, not "rays" (the verified RTNN pattern, PPoPP'22).
+ *
+ * It sits on the cajeta-gpu foundation: the index is a bottom-level
+ * {@link AccelerationStructure} (a BVH over per-point AABBs) and each query is a
+ * {@link RayQuery} walk inside a compute kernel — no RT pipeline, no hit shaders.
+ *
+ * v1 (P1.0) surfaces a single fixed-radius verb, `countWithin`, with an L-infinity
+ * (box-overlap) neighbourhood: each datum is wrapped in an axis-aligned box of
+ * half-extent `r`, so a query point lands inside a datum's box exactly when it is
+ * within `r` (L-inf) of that datum. The exact-L2 refinement is the custom-predicate
+ * callback (P1.1); knn / radius / range / contains and the compute fallback are
+ * later P1 stages. 3-D only (BVH-as-index is natively 3-D — see plan P1.6).
+ */
+public final class SpatialIndex {
+    AccelerationStructure bvh;
+    uint32 pointCount;
+    float32 halfExtent;
+
+    /**
+     * Build an index over `count` 3-D points (packed xyz, 3 float32 per point).
+     * Each datum is wrapped in a box of half-extent `radius`; a later
+     * `countWithin` then counts, per query point, how many data boxes contain it
+     * (= neighbours within `radius` under the L-inf metric). The device BVH is
+     * acquired here and released when this SpatialIndex drops (the AccelerationStructure
+     * field is freed by the drop chain).
+     */
+    public SpatialIndex(float32[] points, uint32 count, float32 radius) {
+        this.pointCount = count;
+        this.halfExtent = radius;
+        float32[] boxes = new float32[count * 6];
+        for (uint32 i = 0; i < count; i = i + 1) {
+            float32 x = points[i * 3 + 0];
+            float32 y = points[i * 3 + 1];
+            float32 z = points[i * 3 + 2];
+            boxes[i * 6 + 0] = x - radius;
+            boxes[i * 6 + 1] = y - radius;
+            boxes[i * 6 + 2] = z - radius;
+            boxes[i * 6 + 3] = x + radius;
+            boxes[i * 6 + 4] = y + radius;
+            boxes[i * 6 + 5] = z + radius;
+        }
+        this.bvh = heap AccelerationStructure(boxes, count);
+    }
+
+    public uint32 count() {
+        return this.pointCount;
+    }
+
+    /**
+     * The query kernel (library-internal): for each of `n` query points, walk the
+     * BVH with a degenerate near-zero-length ray cast from the point and count the
+     * candidate AABBs it falls inside — the fixed-radius neighbour count. The
+     * encode-as-rays trick is hidden behind `countWithin`; users never see this.
+     */
+    @Kernel
+    public static void countWithinKernel(AccelerationStructure scene,
+                                         Buffer<float32> qx, Buffer<float32> qy,
+                                         Buffer<float32> qz, Buffer<uint32> out,
+                                         uint32 n) {
+        uint32 i = Thread.globalIdX();
+        if (i < n) {
+            RayQuery rq;
+            rq.initialize(scene, 0, 255,
+                          qx[i], qy[i], qz[i], 0.0f,
+                          0.0f, 0.0f, 1.0f, 0.001f);
+            uint32 c = 0;
+            while (rq.proceed()) {
+                if (rq.candidateType() == 1) {
+                    c = c + 1;
+                }
+            }
+            out[i] = c;
+        }
+    }
+
+    /**
+     * Fixed-radius neighbour count: fills `out[i]` with the number of indexed
+     * points within the index's radius (L-inf) of query point i = (qx[i], qy[i],
+     * qz[i]). The query buffers and `out` are caller-owned device buffers of length
+     * `n`; this dispatches the internal kernel and waits for completion.
+     */
+    public void countWithin(Buffer<float32> qx, Buffer<float32> qy,
+                            Buffer<float32> qz, Buffer<uint32> out, uint32 n) {
+        uint32 groups = (n + 63) / 64;
+        Stream s = Stream.current();
+        countWithinKernel.launch(s, grid: [groups], block: [64])(
+            this.bvh, qx, qy, qz, out, n);
+        s.sync();
+    }
+}
