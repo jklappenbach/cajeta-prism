@@ -108,4 +108,62 @@ public final class SpatialIndex {
             this.bvh, qx, qy, qz, out, n);
         s.sync();
     }
+
+    /**
+     * P1.1 — exact-L2 query kernel (custom-predicate refinement). The BVH gives box
+     * (L-infinity) candidates, which over-count: a point can be inside a query
+     * point's box but outside its Euclidean radius. For each AABB candidate we
+     * recover the indexed datum via the candidate's **primitive index** and keep it
+     * only if the TRUE squared distance is within radius². dpx/dpy/dpz are the
+     * indexed points, in the same order the index was built.
+     */
+    @Kernel
+    public static void radiusExactKernel(AccelerationStructure scene,
+                                         Buffer<float32> dpx, Buffer<float32> dpy,
+                                         Buffer<float32> dpz,
+                                         Buffer<float32> qx, Buffer<float32> qy,
+                                         Buffer<float32> qz, Buffer<uint32> out,
+                                         uint32 n, float32 radius) {
+        uint32 i = Thread.globalIdX();
+        if (i < n) {
+            float32 r2 = radius * radius;
+            RayQuery rq;
+            rq.initialize(scene, 0, 255,
+                          qx[i], qy[i], qz[i], 0.0f,
+                          0.0f, 0.0f, 1.0f, 0.001f);
+            uint32 c = 0;
+            while (rq.proceed()) {
+                if (rq.candidateType() == 1) {
+                    uint32 pi = rq.candidatePrimitiveIndex();
+                    float32 dx = qx[i] - dpx[pi];
+                    float32 dy = qy[i] - dpy[pi];
+                    float32 dz = qz[i] - dpz[pi];
+                    if (dx * dx + dy * dy + dz * dz <= r2) {
+                        c = c + 1;
+                    }
+                }
+            }
+            out[i] = c;
+        }
+    }
+
+    /**
+     * Exact fixed-radius (L2) neighbour count. Unlike `countWithin` (which counts
+     * box overlaps = an L-infinity approximation), this refines each candidate to
+     * the true Euclidean distance via the candidate's primitive index, so points
+     * inside the box but outside the radius are excluded. `dpx/dpy/dpz` are the
+     * indexed points in build order; `qx/qy/qz` the queries. For correctness the
+     * index's build radius must be >= `radius` (so every L2 neighbour is a box
+     * candidate).
+     */
+    public void radiusExact(Buffer<float32> dpx, Buffer<float32> dpy,
+                            Buffer<float32> dpz, Buffer<float32> qx,
+                            Buffer<float32> qy, Buffer<float32> qz,
+                            Buffer<uint32> out, uint32 n, float32 radius) {
+        uint32 groups = (n + 63) / 64;
+        Stream s = Stream.current();
+        radiusExactKernel.launch(s, grid: [groups], block: [64])(
+            this.bvh, dpx, dpy, dpz, qx, qy, qz, out, n, radius);
+        s.sync();
+    }
 }
