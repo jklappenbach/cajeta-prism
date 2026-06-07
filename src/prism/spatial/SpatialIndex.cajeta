@@ -48,7 +48,7 @@ public final class SpatialIndex {
         // corrupting the heap on bounds-off builds. Widen so it can't wrap (a
         // genuinely huge count just fails the allocation cleanly instead).
         int64 n = (int64) count;
-        float32[] boxes = new float32[n * 6];
+        float32[] boxes = heap float32[n * 6];
         for (int64 i = 0; i < n; i = i + 1) {
             float32 x = points[i * 3 + 0];
             float32 y = points[i * 3 + 1];
